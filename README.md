@@ -144,6 +144,11 @@ you just have to make the dispatch decisions yourself each time.
   `--force`. Windows-specific; a no-op elsewhere.
 - **Headless by default.** `CI=1`, `BROWSER=true`, opencode web UI and
   auto-share disabled. No browser, no self-update, no telemetry.
+- **A worktree containing a junction cannot be removed non-forced.** The
+  junction itself is an untracked entry, so `git status` reports the tree
+  dirty and `force=False` refuses; `force=True` is refused *because* of the
+  junction. Delete or `git add` the links first. This deadlock is
+  deliberate -- both directions err towards not touching your main tree.
 - **Output is capped** at 20 000 chars (2 000 for stderr). Timeouts: 600 s
   default, 3600 s maximum.
 

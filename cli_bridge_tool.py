@@ -33,6 +33,7 @@ import shutil
 import stat
 import subprocess
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,23 @@ def _clamp_timeout(value: Any) -> int:
     return max(1, min(t, MAX_TIMEOUT))
 
 
+def _as_bool(value: Any) -> bool:
+    """Coerce a bool-ish argument to a real bool.
+
+    Tool arguments frequently arrive as strings, and in Python any non-empty
+    string is truthy -- force="false" would silently become a forced removal.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
 def _valid_dir(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
@@ -170,17 +188,52 @@ def _is_git_repo(path: str) -> bool:
     return r.get("exit_code") == 0 and (r.get("output") or "").strip() == "true"
 
 
+def _lstat(p: str):
+    """os.lstat with OSError -> None."""
+    try:
+        return os.lstat(p)
+    except OSError:
+        return None
+
+
+def _is_reparse(p: str, st=None) -> bool:
+    """True if *p* is a junction / symlink (a link, not a real directory).
+
+    Uses lstat only -- never islink/isdir, which follow the link. Windows
+    junctions are reparse points that os.path.islink() reports as False, so
+    the reparse attribute is the authoritative test.
+    """
+    st = st if st is not None else _lstat(p)
+    if st is None:
+        return False
+    attrs = getattr(st, "st_file_attributes", 0)
+    if attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+        return True
+    return os.path.islink(p)
+
+
 def _iter_reparse_points(root: str):
-    """Yield paths of junction/symlink entries under *root* (never followed)."""
+    """Yield junction/symlink entries under *root*, WITHOUT descending into them.
+
+    os.walk(followlinks=False) does NOT stop at Windows junctions: they are
+    reparse points whose os.path.islink() is False, so walk happily descends
+    into the junction TARGET. That is how the original code yielded links
+    living *inside* a target (e.g. <wt>/node_modules/pkg/.bin/foo) and then
+    deleted them -- modifying the target, the exact thing this module exists
+    to prevent. So reparse directories are yielded and pruned from dirnames.
+    """
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        for name in list(dirnames) + list(filenames):
+        kept = []
+        for name in dirnames:
             p = os.path.join(dirpath, name)
-            try:
-                st = os.lstat(p)
-            except OSError:
-                continue
-            attrs = getattr(st, "st_file_attributes", 0)
-            if (attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)) or os.path.islink(p):
+            if _is_reparse(p):
+                yield p
+            else:
+                kept.append(name)
+        dirnames[:] = kept
+        for name in filenames:
+            p = os.path.join(dirpath, name)
+            if _is_reparse(p):
                 yield p
 
 
@@ -192,16 +245,23 @@ def _delete_links_only(root: str) -> List[str]:
     removed link paths for the audit trail.
     """
     removed: List[str] = []
+    failed: List[str] = []
     for p in sorted(_iter_reparse_points(root), key=len, reverse=True):
+        st = _lstat(p)
+        # lstat-based: a directory reparse point (junction) needs rmdir, a
+        # file symlink needs remove. isdir()/islink() follow the link and give
+        # the wrong answer for broken junctions.
+        is_dir_link = bool(st) and stat.S_ISDIR(st.st_mode)
         try:
-            if os.path.isdir(p) and not os.path.islink(p):
+            if is_dir_link:
                 os.rmdir(p)          # junction / dir symlink: removes the link only
             else:
                 os.remove(p)         # file symlink
             removed.append(p)
         except OSError as e:
             logger.warning("worktree link cleanup failed for %s: %s", p, e)
-    return removed
+            failed.append(p)
+    return removed, failed
 
 
 def _worktree_path_arg(path: str) -> Optional[str]:
@@ -210,6 +270,34 @@ def _worktree_path_arg(path: str) -> Optional[str]:
         return None
     p = os.path.abspath(path)
     return p if os.path.isdir(p) else None
+
+
+def _abandon_worktree(repo: str, path: str, branch: Optional[str] = None) -> Dict[str, Any]:
+    """Best-effort teardown of a worktree CREATE left half-done.
+
+    Only ever called on the failure path of worktree_create, on a path we
+    just created ourselves. Unlinks junctions first (link only) so we cannot
+    recurse into a target, then removes without --force.
+    """
+    out: Dict[str, Any] = {"path": path}
+    try:
+        if os.path.isdir(path):
+            links = list(_iter_reparse_points(path))
+            if links:
+                _delete_links_only(path)
+                out["unlinked"] = len(links)
+    except OSError as e:
+        out["unlink_error"] = f"{type(e).__name__}: {e}"
+    rm = _run(["git", "-C", repo, "worktree", "remove", path], repo, 60)
+    out["remove_exit"] = rm.get("exit_code")
+    if rm.get("exit_code") != 0:
+        pr = _run(["git", "-C", repo, "worktree", "prune"], repo, 60)
+        out["prune_exit"] = pr.get("exit_code")
+        out["stderr"] = (rm.get("stderr") or "")[:500]
+    if branch:
+        bd = _run(["git", "-C", repo, "branch", "-D", branch], repo, 60)
+        out["branch_delete_exit"] = bd.get("exit_code")
+    return out
 
 
 def worktree_create(
@@ -229,12 +317,18 @@ def worktree_create(
     if not r:
         return {"status": "error", "error": f"repo not found: {repo!r}"}
     if not _is_git_repo(r):
-        return {"status": "error", "error": f"not a git worktree: {r!r}"}
+        return {"status": "error", "error": f"not a git repository: {r!r}"}
 
     if not branch:
-        branch = "wt/" + time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        # Second-resolution collides when two calls land in the same second
+        # (verified: second call fails with "target path already exists").
+        branch = "wt/" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
     if not path:
         safe = branch.replace("/", "-").replace("\\", "-")
+        # strip a leading "wt-" so the default path is <repo>-wt-<stamp>,
+        # not <repo>-wt-wt-<stamp>
+        if safe.startswith("wt-"):
+            safe = safe[3:]
         path = os.path.join(os.path.dirname(r), os.path.basename(r) + "-wt-" + safe)
     path = os.path.abspath(path)
     if os.path.exists(path):
@@ -251,7 +345,13 @@ def worktree_create(
     chk = _run(["git", "-C", path, "rev-parse", "--show-toplevel"], path, 30)
     top = (chk.get("output") or "").strip()
     if os.path.normcase(os.path.realpath(top)) != os.path.normcase(os.path.realpath(path)):
-        return {"status": "error", "error": f"worktree verification failed (toplevel={top!r})", "path": path}
+        # git worktree add already succeeded AND -b already created the branch;
+        # leaving them behind orphans the caller (a retry then hits
+        # "target path already exists" / "branch already exists").
+        cleanup = _abandon_worktree(r, path, branch)
+        return {"status": "error",
+                "error": f"worktree verification failed (toplevel={top!r})",
+                "path": path, "cleanup": cleanup}
     return {"status": "completed", "repo": r, "branch": branch, "path": path}
 
 
@@ -259,7 +359,7 @@ def worktree_list(repo: str, timeout: int = 60) -> Dict[str, Any]:
     """List worktrees attached to *repo* (audit / cleanup)."""
     r = _valid_dir(repo)
     if not r or not _is_git_repo(r):
-        return {"status": "error", "error": f"not a git worktree: {repo!r}"}
+        return {"status": "error", "error": f"not a git repository: {repo!r}"}
     res = _run(["git", "-C", r, "worktree", "list", "--porcelain"], r, _clamp_timeout(timeout))
     if res.get("exit_code") != 0:
         return {"status": "error", "error": "git worktree list failed", "stderr": res.get("stderr")}
@@ -280,10 +380,35 @@ def worktree_remove(
     """
     r = _valid_dir(repo)
     if not r or not _is_git_repo(r):
-        return {"status": "error", "error": f"not a git worktree: {repo!r}"}
+        return {"status": "error", "error": f"not a git repository: {repo!r}"}
     p = _worktree_path_arg(path)
     if not p:
         return {"status": "error", "error": f"worktree path not found: {path!r}"}
+
+    # F6: force must be a real boolean. LLM tool args often arrive as strings
+    # and any non-empty string is truthy in Python -- force="false" used to
+    # silently upgrade to a forced removal and delete uncommitted work.
+    force = _as_bool(force)
+
+    # F4: confirm the path really is a worktree of THIS repo before doing
+    # anything destructive. Previously links were deleted first and git only
+    # rejected afterwards, so a failed call still left the user's junctions
+    # deleted (verified: exit 128 "not a working tree", junction gone).
+    top = _run(["git", "-C", p, "rev-parse", "--show-toplevel"], p, 30)
+    top_val = (top.get("output") or "").strip()
+    if top.get("exit_code") != 0 or not top_val:
+        return {"status": "error",
+                "error": "path is not inside a git working tree; refusing to touch it",
+                "path": p, "stderr": (top.get("stderr") or "")[:300]}
+    if os.path.normcase(os.path.realpath(top_val)) != os.path.normcase(os.path.realpath(p)):
+        return {"status": "error",
+                "error": "path is not the top level of a worktree; refusing to touch it",
+                "path": p, "toplevel": top_val}
+    main_top = _run(["git", "-C", r, "rev-parse", "--show-toplevel"], r, 30)
+    if os.path.normcase(os.path.realpath((main_top.get("output") or "").strip())) \
+            == os.path.normcase(os.path.realpath(p)):
+        return {"status": "error",
+                "error": "path is the MAIN working tree; refusing to remove it", "path": p}
 
     links = list(_iter_reparse_points(p))
     if links and force:
@@ -297,16 +422,47 @@ def worktree_remove(
                     "error": "worktree has uncommitted changes; commit them or pass force=true",
                     "dirty": st.get("output")}
 
-    removed_links = _delete_links_only(p) if links else []
+    removed_links: List[str] = []
+    failed_links: List[str] = []
+    if links:
+        removed_links, failed_links = _delete_links_only(p)
+    # A link we failed to unlink is exactly the thing git --force would
+    # follow; do not hand a known-bad tree to git.
+    if failed_links:
+        return {"status": "error",
+                "error": "could not unlink all junction/symlink entries; refusing to remove",
+                "removed_links": removed_links, "failed_links": failed_links, "path": p}
+    # TOCTOU: the scan is not a guarantee. Re-check right before removing.
+    if not force and _iter_reparse_points(p):
+        again = list(_iter_reparse_points(p))
+        if again:
+            return {"status": "error",
+                    "error": "junction/symlink appeared during cleanup; refusing to remove",
+                    "links": again[:20], "path": p}
+
     cmd = ["git", "-C", r, "worktree", "remove", p]
     if force:
         cmd.append("--force")
     res = _run(cmd, r, _clamp_timeout(timeout))
     ok = res.get("exit_code") == 0
+    # F5: exit 0 is not proof the worktree is gone; verify.
+    verified_gone = None
+    verified_unregistered = None
+    if ok:
+        verified_gone = not os.path.exists(p)
+        lst = _run(["git", "-C", r, "worktree", "list", "--porcelain"], r, 60)
+        listing = lst.get("output") or ""
+        verified_unregistered = os.path.normcase(os.path.realpath(p)) not in \
+            os.path.normcase(listing)
+        if not (verified_gone and verified_unregistered):
+            ok = False
     return {
         "status": "completed" if ok else "error",
         "exit_code": res.get("exit_code"),
         "removed_links": removed_links,
+        "path": p,
+        "verified_path_gone": verified_gone,
+        "verified_unregistered": verified_unregistered,
         "stderr": res.get("stderr"),
         "output": res.get("output"),
     }
@@ -401,7 +557,11 @@ def codex_review(
     if not d:
         return {"status": "error", "error": f"directory not found: {directory!r}"}
 
-    cmd = [binary, "review"]
+    # _bin_prefix, not _resolve_bin: when codex is a `node launcher.mjs` shim,
+    # _resolve_bin returns node itself and `[node, "review", ...]` makes node
+    # try to load "review" as a script (verified: exit 1, Cannot find module).
+    cmd = _bin_prefix("codex") or [binary]
+    cmd += ["review"]
     # codex review: a custom PROMPT is mutually exclusive with --uncommitted/--base
     # (verified: "the argument '--uncommitted' cannot be used with '[PROMPT]'").
     if prompt:
@@ -479,16 +639,19 @@ def cli_bridge_handler(args: Dict[str, Any], **kwargs) -> str:
             res = worktree_remove(
                 repo=str(args.get("repo", "") or args.get("directory", "") or ""),
                 path=str(args.get("path", "") or ""),
-                force=bool(args.get("force", False)),
+                force=_as_bool(args.get("force", False)),
                 timeout=args.get("timeout", 120),
             )
         elif action == "status":
             res = {
+                "status": "completed",
                 "qoderclicn": _resolve_bin("qoderclicn") or _resolve_bin("qodercli"),
                 "codex": _resolve_bin("codex"),
             }
         else:
-            res = {"error": f"unknown action {action!r}; use: qoder_run, codex_review, codex_exec, status"}
+            res = {"error": "unknown action %r; use: %s" % (
+                action,
+                ", ".join(CLI_BRIDGE_SCHEMA["parameters"]["properties"]["action"]["enum"]))}
     except Exception as e:  # never let the tool raise into the agent loop
         logger.exception("cli-bridge error")
         res = {"status": "error", "error": f"{type(e).__name__}: {e}"}
@@ -522,12 +685,13 @@ CLI_BRIDGE_SCHEMA = {
             "repo": {"type": "string", "description": "worktree_*: the MAIN git repo to attach the worktree to."},
             "branch": {"type": "string", "description": "worktree_create: branch name (default wt/<utc-timestamp>)."},
             "path": {"type": "string", "description": "worktree_create/remove: worktree path (default <repo>-wt-<branch>)."},
-            "force": {"type": "boolean", "description": "worktree_remove: force removal; refused if junction/symlink present."},
+            "force": {"type": "boolean", "description": "worktree_remove: force removal (--force). force=True is REFUSED when the worktree contains a junction/symlink; with force=False, links are unlinked (link only, never target) before removal."},
             "permission_mode": {"type": "string", "description": "qoder_run permission mode (default bypass_permissions -- dont_ask denies writes)."},
             "sandbox": {"type": "string", "description": "codex_exec sandbox (default read-only)."},
             "model": {"type": "string", "description": "Optional model override (qoder_run)."},
-            "timeout": {"type": "integer", "description": f"Seconds (default {DEFAULT_TIMEOUT}, max {MAX_TIMEOUT})."},
+            "timeout": {"type": "integer", "description": f"Seconds (default {DEFAULT_TIMEOUT} for CLI actions, 120 for worktree_create/remove, 60 for worktree_list; max {MAX_TIMEOUT})."},
         },
         "required": ["action"],
+        "additionalProperties": False,
     },
 }
