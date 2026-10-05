@@ -1,6 +1,6 @@
 name: cli-bridge
-version: 1.1.0
-description: "GLOBAL (all profiles): thin Hermes tools driving local coding CLIs — qoderclicn (executor, worktree-scoped writes) and codex (read-only reviewer). Implements the multi-cli-orchestration role contract. Project-agnostic; lives in the global plugins dir and is junction-linked into each profile."
+version: 1.2.0
+description: "GLOBAL (all profiles): thin Hermes tools driving local coding CLIs — qoderclicn (executor, worktree-scoped writes) and codex (read-only reviewer), plus a junction-safe worktree lifecycle (create/list/remove). Implements the multi-cli-orchestration role contract. Project-agnostic; lives in the global plugins dir and is junction-linked into each profile."
 author: LOX (通过对话提炼)
 provides_tools:
   - cli_bridge

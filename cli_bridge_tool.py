@@ -5,6 +5,8 @@ Implements the role contract in the ``multi-cli-orchestration`` skill:
 
   * ``qoder_run``   -> qoderclicn as the EXECUTOR (writes allowed, worktree-scoped)
   * ``codex_review``-> codex as the READ-ONLY reviewer (code review of a diff)
+  * ``worktree_*``  -> create / list / remove an ISOLATED git worktree for the
+    executor, so the caller never hand-manages the write scope.
 
 Design notes (all learned the hard way -- do not "simplify" them away):
 
@@ -28,7 +30,9 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -142,6 +146,170 @@ def _valid_dir(path: Optional[str]) -> Optional[str]:
         return None
     resolved = os.path.realpath(path)
     return resolved if os.path.isdir(resolved) else None
+
+
+# ---------------------------------------------------------------------------
+# Worktree lifecycle (T-4) -- isolated write scope for the executor
+# ---------------------------------------------------------------------------
+# The executor (qoder_run) may only write inside an isolated git worktree (the
+# single-writer rule). These primitives automate create / list / remove so the
+# caller never hand-manages a worktree.
+#
+# SAFETY (learned the hard way -- see the multi-cli-orchestration skill):
+#   ``git worktree remove --force`` recurses into the worktree and FOLLOWS
+#   junction/symlink targets, which can empty the MAIN tree (a real incident
+#   deleted the main repo's node_modules through a junction). We therefore:
+#     1. refuse ``force`` when the worktree tree contains any reparse point
+#        (junction / symlink), and
+#     2. delete such links FIRST -- the LINK only, never its target -- before any
+#        ``git worktree remove``.
+
+
+def _is_git_repo(path: str) -> bool:
+    r = _run(["git", "-C", path, "rev-parse", "--is-inside-work-tree"], path, 30)
+    return r.get("exit_code") == 0 and (r.get("output") or "").strip() == "true"
+
+
+def _iter_reparse_points(root: str):
+    """Yield paths of junction/symlink entries under *root* (never followed)."""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in list(dirnames) + list(filenames):
+            p = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            attrs = getattr(st, "st_file_attributes", 0)
+            if (attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)) or os.path.islink(p):
+                yield p
+
+
+def _delete_links_only(root: str) -> List[str]:
+    """Delete junction/symlink entries under *root* -- the LINK only, never its target.
+
+    Directories are removed with ``os.rmdir`` (unlinks a junction/dir-symlink
+    WITHOUT recursing into the target); files with ``os.remove``. Returns the
+    removed link paths for the audit trail.
+    """
+    removed: List[str] = []
+    for p in sorted(_iter_reparse_points(root), key=len, reverse=True):
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                os.rmdir(p)          # junction / dir symlink: removes the link only
+            else:
+                os.remove(p)         # file symlink
+            removed.append(p)
+        except OSError as e:
+            logger.warning("worktree link cleanup failed for %s: %s", p, e)
+    return removed
+
+
+def _worktree_path_arg(path: str) -> Optional[str]:
+    """Validate a worktree path WITHOUT following links (abspath, not realpath)."""
+    if not path:
+        return None
+    p = os.path.abspath(path)
+    return p if os.path.isdir(p) else None
+
+
+def worktree_create(
+    repo: str,
+    branch: Optional[str] = None,
+    path: Optional[str] = None,
+    base: Optional[str] = None,
+    timeout: int = 120,
+) -> Dict[str, Any]:
+    """Create an ISOLATED git worktree for the executor; return its path.
+
+    ``branch`` defaults to ``wt/<utc-timestamp>``; ``path`` defaults to a sibling
+    directory ``<repo>-wt-<sanitized-branch>``. ``base`` is an optional start
+    point (branch/commit) for ``git worktree add -b``.
+    """
+    r = _valid_dir(repo)
+    if not r:
+        return {"status": "error", "error": f"repo not found: {repo!r}"}
+    if not _is_git_repo(r):
+        return {"status": "error", "error": f"not a git worktree: {r!r}"}
+
+    if not branch:
+        branch = "wt/" + time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    if not path:
+        safe = branch.replace("/", "-").replace("\\", "-")
+        path = os.path.join(os.path.dirname(r), os.path.basename(r) + "-wt-" + safe)
+    path = os.path.abspath(path)
+    if os.path.exists(path):
+        return {"status": "error", "error": f"target path already exists: {path!r}"}
+
+    cmd = ["git", "-C", r, "worktree", "add", "-b", branch, path]
+    if base:
+        cmd.append(base)
+    res = _run(cmd, r, _clamp_timeout(timeout))
+    if res.get("exit_code") != 0:
+        return {"status": "error", "error": "git worktree add failed", "cmd": cmd,
+                "stderr": res.get("stderr"), "output": res.get("output")}
+
+    chk = _run(["git", "-C", path, "rev-parse", "--show-toplevel"], path, 30)
+    top = (chk.get("output") or "").strip()
+    if os.path.normcase(os.path.realpath(top)) != os.path.normcase(os.path.realpath(path)):
+        return {"status": "error", "error": f"worktree verification failed (toplevel={top!r})", "path": path}
+    return {"status": "completed", "repo": r, "branch": branch, "path": path}
+
+
+def worktree_list(repo: str, timeout: int = 60) -> Dict[str, Any]:
+    """List worktrees attached to *repo* (audit / cleanup)."""
+    r = _valid_dir(repo)
+    if not r or not _is_git_repo(r):
+        return {"status": "error", "error": f"not a git worktree: {repo!r}"}
+    res = _run(["git", "-C", r, "worktree", "list", "--porcelain"], r, _clamp_timeout(timeout))
+    if res.get("exit_code") != 0:
+        return {"status": "error", "error": "git worktree list failed", "stderr": res.get("stderr")}
+    return {"status": "completed", "repo": r, "worktrees": res.get("output") or ""}
+
+
+def worktree_remove(
+    repo: str,
+    path: str,
+    force: bool = False,
+    timeout: int = 120,
+) -> Dict[str, Any]:
+    """Remove a worktree SAFELY (link-aware).
+
+    Refuses ``force`` if the worktree contains junction/symlink; unlinks those
+    links FIRST (link only, never target), then runs ``git worktree remove``
+    WITHOUT recursing through links.
+    """
+    r = _valid_dir(repo)
+    if not r or not _is_git_repo(r):
+        return {"status": "error", "error": f"not a git worktree: {repo!r}"}
+    p = _worktree_path_arg(path)
+    if not p:
+        return {"status": "error", "error": f"worktree path not found: {path!r}"}
+
+    links = list(_iter_reparse_points(p))
+    if links and force:
+        return {"status": "error",
+                "error": "refusing --force: worktree contains junction/symlink (would recurse into targets)",
+                "links": links[:20], "count": len(links)}
+    if not force:
+        st = _run(["git", "-C", p, "status", "--porcelain"], p, 60)
+        if (st.get("output") or "").strip():
+            return {"status": "error",
+                    "error": "worktree has uncommitted changes; commit them or pass force=true",
+                    "dirty": st.get("output")}
+
+    removed_links = _delete_links_only(p) if links else []
+    cmd = ["git", "-C", r, "worktree", "remove", p]
+    if force:
+        cmd.append("--force")
+    res = _run(cmd, r, _clamp_timeout(timeout))
+    ok = res.get("exit_code") == 0
+    return {
+        "status": "completed" if ok else "error",
+        "exit_code": res.get("exit_code"),
+        "removed_links": removed_links,
+        "stderr": res.get("stderr"),
+        "output": res.get("output"),
+    }
 
 
 def _run(cmd: List[str], cwd: str, timeout: int) -> Dict[str, Any]:
@@ -294,6 +462,26 @@ def cli_bridge_handler(args: Dict[str, Any], **kwargs) -> str:
                 timeout=args.get("timeout", DEFAULT_TIMEOUT),
                 sandbox=str(args.get("sandbox", "read-only") or "read-only"),
             )
+        elif action == "worktree_create":
+            res = worktree_create(
+                repo=str(args.get("repo", "") or args.get("directory", "") or ""),
+                branch=(str(args["branch"]) if args.get("branch") else None),
+                path=(str(args["path"]) if args.get("path") else None),
+                base=(str(args["base"]) if args.get("base") else None),
+                timeout=args.get("timeout", 120),
+            )
+        elif action == "worktree_list":
+            res = worktree_list(
+                repo=str(args.get("repo", "") or args.get("directory", "") or ""),
+                timeout=args.get("timeout", 60),
+            )
+        elif action == "worktree_remove":
+            res = worktree_remove(
+                repo=str(args.get("repo", "") or args.get("directory", "") or ""),
+                path=str(args.get("path", "") or ""),
+                force=bool(args.get("force", False)),
+                timeout=args.get("timeout", 120),
+            )
         elif action == "status":
             res = {
                 "qoderclicn": _resolve_bin("qoderclicn") or _resolve_bin("qodercli"),
@@ -313,23 +501,29 @@ CLI_BRIDGE_SCHEMA = {
         "Drive local coding CLIs per the multi-cli-orchestration role contract. "
         "Actions: 'qoder_run' (EXECUTOR -- qoderclicn writes inside an ISOLATED worktree; "
         "directory is mandatory), 'codex_review' (READ-ONLY -- codex reviews a repo diff), "
-        "'codex_exec' (READ-ONLY -- codex exec in a read-only sandbox), 'status' (probe availability). "
-        "Never point qoder_run at the main working tree."
+        "'codex_exec' (READ-ONLY -- codex exec in a read-only sandbox), "
+        "'worktree_create/list/remove' (manage an isolated executor worktree safely), "
+        "'status' (probe availability). Never point qoder_run at the main working tree."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["qoder_run", "codex_review", "codex_exec", "status"],
+                "enum": ["qoder_run", "codex_review", "codex_exec",
+                         "worktree_create", "worktree_list", "worktree_remove", "status"],
             },
             "prompt": {"type": "string", "description": "Task / review instructions."},
             "directory": {
                 "type": "string",
                 "description": "Working directory. For qoder_run this MUST be an isolated worktree.",
             },
-            "base": {"type": "string", "description": "codex_review: review against this branch instead of uncommitted."},
-            "permission_mode": {"type": "string", "description": "qoder_run permission mode (default dont_ask)."},
+            "base": {"type": "string", "description": "codex_review: review against this branch instead of uncommitted; worktree_create: start point."},
+            "repo": {"type": "string", "description": "worktree_*: the MAIN git repo to attach the worktree to."},
+            "branch": {"type": "string", "description": "worktree_create: branch name (default wt/<utc-timestamp>)."},
+            "path": {"type": "string", "description": "worktree_create/remove: worktree path (default <repo>-wt-<branch>)."},
+            "force": {"type": "boolean", "description": "worktree_remove: force removal; refused if junction/symlink present."},
+            "permission_mode": {"type": "string", "description": "qoder_run permission mode (default bypass_permissions -- dont_ask denies writes)."},
             "sandbox": {"type": "string", "description": "codex_exec sandbox (default read-only)."},
             "model": {"type": "string", "description": "Optional model override (qoder_run)."},
             "timeout": {"type": "integer", "description": f"Seconds (default {DEFAULT_TIMEOUT}, max {MAX_TIMEOUT})."},
