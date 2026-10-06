@@ -8,6 +8,12 @@ Hermes stops doing everything itself. Instead:
 - **`codex` reviews** — read-only, never touches your files.
 - **Hermes plans, dispatches, and writes the final summary** — and nothing else.
 
+> **Repository name.** This repo was originally `multi-session-collaboration`,
+> renamed to `Hermes-multi-session-collaboration`, and renamed to `cli-bridge`
+> on 2026-10-06 to match what it actually contains (the plugin body, not the
+> documentation project the first name described). GitHub keeps 301 redirects
+> for both former names, so existing clones and remote URLs keep working.
+
 The point is not "Hermes can now run a CLI". The point is that **the expensive
 work happens somewhere other than your main conversation**.
 
