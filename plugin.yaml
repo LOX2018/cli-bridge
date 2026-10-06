@@ -1,5 +1,5 @@
 name: cli-bridge
-version: 1.8.0
+version: 1.9.0
 description: "GLOBAL (all profiles): thin Hermes tools driving local coding CLIs — opencode, qoderclicn and codex. Write capability is granted by the worktree boundary, not the CLI name; Hermes is the only committer. All three CLIs are executable workers scoped to isolated worktrees, plus codex_review/codex_exec read-only paths for independent cross-checks, plus a junction-safe worktree lifecycle (create/list/remove). Dispatch semantics per the multi-cli-orchestration skill. Project-agnostic; lives in the global plugins dir and is junction-linked into each profile."
 author: LOX (通过对话提炼)
 provides_tools:

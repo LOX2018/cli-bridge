@@ -20,6 +20,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -131,6 +132,93 @@ def _model_unpinned(model: Optional[str]) -> bool:
 
 # Max retries when rate-limited (prevents infinite loops)
 _MAX_RATE_LIMIT_RETRIES = 3
+
+# ---------------------------------------------------------------------------
+# Version gate (CVE-2026-22812)
+# ---------------------------------------------------------------------------
+# OpenCode < 1.0.216 automatically starts an UNAUTHENTICATED HTTP server that
+# lets any local process -- or any website, via permissive CORS -- execute
+# arbitrary shell commands as the user (CVSS 8.8, NVD: CVE-2026-22812; the
+# PoC exfiltrates .env, SSH keys and tokens by visiting a malicious page while
+# opencode is running).
+#
+# The gate below REFUSES to run the WRITE path on an affected version. It is
+# not a suggestion: a docstring "consider upgrading" gets no reads, while this
+# check blocks the process before opencode ever binds a port.
+MIN_SAFE_OPENCODE_VERSION = (1, 0, 216)
+MIN_SAFE_OPENCODE_LABEL = "1.0.216"
+# CVE-2026-22813 (XSS -> RCE through the Web UI) was fixed in the same release.
+_FIXED_IN = "1.0.216"
+
+
+def _parse_version(version_text: str) -> Optional[tuple]:
+    """Extract a numeric version tuple from CLI output like ``1.18.34``.
+
+    Returns ``None`` when no version can be parsed -- the caller must then
+    treat the version as UNKNOWN, not as safe.
+    """
+    parts = [int(x) for x in re.findall(r"\d+", version_text or "")]
+    if not parts:
+        return None
+    parts = (parts + [0, 0, 0])[:3]
+    return tuple(parts)
+
+
+def opencode_version() -> Optional[str]:
+    """Return the installed OpenCode version string, or ``None`` if unknown."""
+    binary = _resolve_opencode_bin()
+    if not binary:
+        return None
+    try:
+        probe = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,  # opencode never reads stdin
+            text=True,
+            timeout=30,
+            env=_child_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if probe.returncode != 0:
+        return None
+    return ((probe.stdout or "") + (probe.stderr or "")).strip()
+
+
+def opencode_version_violation(strict: bool = True) -> Optional[str]:
+    """Return a human-readable refusal reason if the version is unsafe.
+
+    Returns ``None`` when the version is known-good, so callers can branch on
+    truthiness.
+
+    With ``strict=True`` (the write path) two cases REFUSE -- fail closed:
+
+    * version parses and is below the fixed release -- known vulnerable;
+    * the version cannot be determined at all -- we cannot prove safety, and
+      a write-capable executor reaching an unverified CLI is the exact failure
+      mode this gate exists for.
+
+    With ``strict=False`` (read-only discovery) only a CONFIRMED-vulnerable
+    version is blocked; an unknown version passes through, so a broken
+    ``--version`` probe never blinds the agent to what opencode actually can
+    do.
+    """
+    raw = opencode_version()
+    parsed = _parse_version(raw) if raw else None
+    if parsed is None:
+        if not strict:
+            return None
+        return (f"OpenCode version could not be determined (raw={raw!r}); "
+                f"refusing to run a write-capable executor on an unverified "
+                f"CLI. Install OpenCode {_FIXED_IN}+ or run `opencode --version` "
+                f"to check the binary.")
+    if parsed < MIN_SAFE_OPENCODE_VERSION:
+        return (f"OpenCode {raw} is vulnerable (CVE-2026-22812: unauthenticated "
+                f"HTTP server RCE, CVSS 8.8) and CVE-2026-22813. Refusing to run "
+                f"-- upgrade to OpenCode {_FIXED_IN} or later "
+                f"(npm i -g opencode-ai@^{_FIXED_IN}).")
+    return None
+
 
 # Event types — flat format (opencode run --format json)
 _ET_TEXT = "text"
@@ -587,6 +675,28 @@ def _build_response(
 # Core: opencode run (fire-and-forget)
 # ---------------------------------------------------------------------------
 
+def _exec(cmd: List[str], timeout: int = DEFAULT_TIMEOUT,
+          cwd: Optional[str] = None) -> "subprocess.CompletedProcess":
+    """Run *cmd* and return the completed process.
+
+    Kept at module level (rather than a closure inside ``_run_task``) so the
+    rate-limit fallback chain can be exercised by patching this one symbol.
+
+    ``stdin=DEVNULL`` is load-bearing: an inherited, still-open stdin pipe
+    makes opencode wait forever for EOF with zero output.
+
+    ``timeout``/``cwd`` default to process globals so older callers are unchanged.
+    """
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        timeout=timeout,
+        cwd=cwd or os.getcwd(),
+        env=_child_env(),
+    )
+
 def _run_task(
     prompt: str,
     directory: Optional[str] = None,
@@ -609,8 +719,25 @@ def _run_task(
     chain reachable. A caller-supplied model is respected as-is and the fallback
     chain is skipped, so an explicit choice is never overridden.
     """
+    # Version gate (CVE-2026-22812). opencode run binds an unauthenticated HTTP
+    # server; on an affected release that server is an RCE primitive. Fail
+    # CLOSED before the process is spawned, and report the version either way
+    # so a refusal is diagnosable rather than opaque.
+    _vviolation = opencode_version_violation(strict=True)
+    if _vviolation:
+        return {
+            "status": "error",
+            "error": _vviolation,
+            "version_check": {"installed": opencode_version(),
+                              "minimum": MIN_SAFE_OPENCODE_LABEL,
+                              "advisory": "CVE-2026-22812"},
+        }
+
     _pinned = not _model_unpinned(model)
-    if model is UNPINNED_MODEL:
+    # Unpin any sentinel OR a bare ``None`` (the caller may omit the
+    # model entirely) so that downstream code and the audit trail both
+    # see the real model name instead of ``None``.
+    if _model_unpinned(model):
         model = DEFAULT_OPENCODE_MODEL
 
     def _build_cmd(agent_override: Optional[str]) -> List[str]:
@@ -632,21 +759,13 @@ def _run_task(
         cmd.append(prompt)
         return cmd
 
-    def _exec(cmd: List[str]):
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            stdin=subprocess.DEVNULL,  # never let opencode block reading an inherited stdin pipe
-            text=True,
-            timeout=timeout,
-            cwd=directory or os.getcwd(),
-            env=_child_env(),
-        )
+    # Execution goes through the module-level ``_exec`` wrapper so the
+    # fallback chain below is testable by patching one symbol.
 
     logger.info("Running opencode task (timeout=%ds, agent=%s)", timeout, agent or "<default>")
 
     try:
-        result = _exec(_build_cmd(agent))
+        result = _exec(_build_cmd(agent), timeout, directory)
     except subprocess.TimeoutExpired:
         return {
             "status": "timeout",
@@ -664,7 +783,7 @@ def _run_task(
             "retrying with built-in '%s' agent.", FALLBACK_AGENT,
         )
         try:
-            result = _exec(_build_cmd(FALLBACK_AGENT))
+            result = _exec(_build_cmd(FALLBACK_AGENT), timeout, directory)
             fell_back = True
         except subprocess.TimeoutExpired:
             return {
@@ -673,23 +792,35 @@ def _run_task(
             }
 
     # Rate-limit fallback: if the model is rate-limited, try fallback models.
-    # Only triggers when the caller did NOT pin a specific model (respects
-    # explicit model choice). Preserves session_id so the fallback continues
+    # Only triggers when the caller did NOT pin a specific model (respects an
+    # explicit model choice). The session is preserved so the fallback continues
     # the same conversation.
+    #
+    # `request_effective` is the model we actually asked for. The caller may omit
+    # the model entirely (None), which is legal -- recording the raw argument
+    # there would break the audit trail at its very start, leaving no way to tell
+    # which model the fallback chain began from.
+    # The model actually used, resolved above. Never ``None``: that
+    # would break the audit trail at its very start.
+    request_effective = model
+    actual_model: Optional[str] = None
+    degraded = False
+    tried_models: List[str] = []
+
     if not _pinned and _is_rate_limited(result.stdout, result.stderr):
         logger.warning("Rate limit detected, trying fallback models")
         effective_agent = FALLBACK_AGENT if fell_back else (agent or None)
-        tried_models: List[str] = []
 
         for fb_model, fb_variant in _FALLBACK_MODELS[:_MAX_RATE_LIMIT_RETRIES]:
             tried_models.append(fb_model)
             logger.info("Retrying with fallback model: %s", fb_model)
 
-            cmd = _build_cmd(effective_agent)
-            cmd = _build_cmd_with_model(cmd, fb_model, fb_variant)
+            cmd = _build_cmd_with_model(
+                _build_cmd(effective_agent), fb_model, fb_variant
+            )
 
             try:
-                result = _exec(cmd)
+                result = _exec(cmd, timeout, directory)
             except subprocess.TimeoutExpired:
                 return {
                     "status": "timeout",
@@ -697,10 +828,35 @@ def _run_task(
                 }
 
             if not _is_rate_limited(result.stdout, result.stderr):
-                break  # Success with this model
+                actual_model = fb_model
+                degraded = True
+                break
 
+        if actual_model is None:
+            # Every fallback was rate-limited too. Returning the rate-limited
+            # message as if the run had completed is an unrecoverable failure
+            # indistinguishable from success, so fail loudly instead.
+            return {
+                "status": "error",
+                "error": ("Model unavailable: the requested model and every "
+                          "fallback in the chain were rate-limited."),
+                "reason": "rate_limit_chain_exhausted",
+                "rate_limited": True,
+                "degraded": False,
+                "requested_model": request_effective,
+                "actual_model": None,
+                "tried_models": [request_effective] + tried_models,
+                "chain_exhausted": True,
+            }
+
+        # "degraded" means a DIFFERENT model answered than the one requested.
+        # Re-running the same model after a 429 is a retry, not a degradation;
+        # callers need to be able to tell the two apart.
         response_extra = {
             "rate_limited": True,
+            "degraded": degraded and actual_model != request_effective,
+            "requested_model": request_effective,
+            "actual_model": actual_model,
             "tried_models": tried_models,
         }
     else:
@@ -738,8 +894,24 @@ def _session_prompt(
     ``model=UNPINNED_MODEL`` (default) uses :data:`DEFAULT_OPENCODE_MODEL` and
     keeps the rate-limit fallback chain reachable; see ``_run_task``.
     """
+    # Version gate (CVE-2026-22812). This path starts the opencode server, which
+    # is exactly the unauthenticated surface the CVE describes, so the check must
+    # run BEFORE _start_server() binds the port -- not after.
+    _vviolation = opencode_version_violation(strict=True)
+    if _vviolation:
+        return {
+            "status": "error",
+            "error": _vviolation,
+            "version_check": {"installed": opencode_version(),
+                              "minimum": MIN_SAFE_OPENCODE_LABEL,
+                              "advisory": "CVE-2026-22812"},
+        }
+
     _pinned = not _model_unpinned(model)
-    if model is UNPINNED_MODEL:
+    # Unpin any sentinel OR a bare ``None`` (the caller may omit the
+    # model entirely) so that downstream code and the audit trail both
+    # see the real model name instead of ``None``.
+    if _model_unpinned(model):
         model = DEFAULT_OPENCODE_MODEL
     port = _start_server()
     attach_url = f"http://localhost:{port}"
@@ -777,11 +949,18 @@ def _session_prompt(
             "error": f"Session prompt timed out after {timeout}s",
         }
 
-    # Rate-limit fallback for session mode: try fallback models while
-    # preserving the same session_id so the conversation continues.
+    # Rate-limit fallback for session mode: try fallback models while preserving
+    # the same session_id so the conversation continues. Keep this in sync with
+    # the equivalent block in `_run_task` -- the two must stay identical.
+    # The model actually used, resolved above. Never ``None``: that
+    # would break the audit trail at its very start.
+    request_effective = model
+    actual_model: Optional[str] = None
+    degraded = False
+    tried_models: List[str] = []
+
     if not _pinned and _is_rate_limited(result.stdout, result.stderr):
         logger.warning("Rate limit detected in session mode, trying fallback models")
-        tried_models: List[str] = []
 
         for fb_model, fb_variant in _FALLBACK_MODELS[:_MAX_RATE_LIMIT_RETRIES]:
             tried_models.append(fb_model)
@@ -790,15 +969,7 @@ def _session_prompt(
             fb_cmd = _build_cmd_with_model(cmd, fb_model, fb_variant)
 
             try:
-                result = subprocess.run(
-                    fb_cmd,
-                    capture_output=True,
-                    stdin=subprocess.DEVNULL,  # never let opencode block reading an inherited stdin pipe
-                    text=True,
-                    timeout=timeout,
-                    cwd=directory or os.getcwd(),
-                    env=_child_env(),
-                )
+                result = _exec(fb_cmd, timeout, directory)
             except subprocess.TimeoutExpired:
                 return {
                     "status": "timeout",
@@ -806,10 +977,29 @@ def _session_prompt(
                 }
 
             if not _is_rate_limited(result.stdout, result.stderr):
+                actual_model = fb_model
+                degraded = True
                 break
+
+        if actual_model is None:
+            return {
+                "status": "error",
+                "error": ("Model unavailable: the requested model and every "
+                          "fallback in the chain were rate-limited."),
+                "reason": "rate_limit_chain_exhausted",
+                "rate_limited": True,
+                "degraded": False,
+                "requested_model": request_effective,
+                "actual_model": None,
+                "tried_models": [request_effective] + tried_models,
+                "chain_exhausted": True,
+            }
 
         response_extra = {
             "rate_limited": True,
+            "degraded": degraded and actual_model != request_effective,
+            "requested_model": request_effective,
+            "actual_model": actual_model,
             "tried_models": tried_models,
         }
     else:

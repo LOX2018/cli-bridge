@@ -272,6 +272,41 @@ def _worktree_path_arg(path: str) -> Optional[str]:
     return p if os.path.isdir(p) else None
 
 
+def _assert_isolated_worktree(path: str, timeout: int = 30) -> Optional[str]:
+    """Refuse *path* unless it is a linked worktree (never the main tree).
+
+    Returns an error message, or ``None`` when the path passes.
+
+    The discriminator is ``git rev-parse --git-dir``: for the MAIN working
+    tree git reports ``.git``; for every linked worktree it reports
+    ``<common>/.git/worktrees/<name>``. That substring test needs no repo
+    argument, so it works for ``qoder_run`` which receives a bare directory
+    and has no repository reference to compare against.
+
+    A deliberately wrong candidate was the ``--git-common-dir`` test (whether
+    it points at the main repo): with no repo argument the main tree returns
+    the relative ``.git`` while a linked worktree returns an absolute path,
+    so the two can never be equal and the check is useless. Verified.
+
+    Non-git paths and git failures fail CLOSED: an executor must prove its
+    scope is isolated, and a path we cannot classify is not accepted.
+    """
+    p = _worktree_path_arg(path)
+    if not p:
+        return f"not a directory: {path!r}"
+    if not _is_git_repo(p):
+        return (f"not a git working tree: {path!r} (executor must run inside an "
+                f"isolated git worktree, not the main tree)")
+    res = _run(["git", "-C", p, "rev-parse", "--git-dir"], p, timeout)
+    gd = (res.get("output") or "").strip()
+    if res.get("exit_code") != 0 or not gd:
+        return f"could not read git-dir of {path!r}; refusing to run there"
+    if "worktrees" in gd.replace(os.sep, "/"):
+        return None  # linked worktree -- isolated
+    return (f"refusing to run: {path!r} is the MAIN working tree (git-dir={gd!r}). "
+            f"Create an isolated worktree with worktree_create and pass that path.")
+
+
 def _abandon_worktree(repo: str, path: str, branch: Optional[str] = None) -> Dict[str, Any]:
     """Best-effort teardown of a worktree CREATE left half-done.
 
@@ -404,11 +439,10 @@ def worktree_remove(
         return {"status": "error",
                 "error": "path is not the top level of a worktree; refusing to touch it",
                 "path": p, "toplevel": top_val}
-    main_top = _run(["git", "-C", r, "rev-parse", "--show-toplevel"], r, 30)
-    if os.path.normcase(os.path.realpath((main_top.get("output") or "").strip())) \
-            == os.path.normcase(os.path.realpath(p)):
-        return {"status": "error",
-                "error": "path is the MAIN working tree; refusing to remove it", "path": p}
+    # Shared main-tree guard (same rule as the executor entry point).
+    err = _assert_isolated_worktree(p)
+    if err:
+        return {"status": "error", "error": err, "path": p}
 
     links = list(_iter_reparse_points(p))
     if links and force:
@@ -528,6 +562,13 @@ def qoder_run(
     d = _valid_dir(directory)
     if not d:
         return {"status": "error", "error": f"directory not found: {directory!r} (executor must be worktree-scoped)"}
+    # Hard boundary, not a prompt convention: refuse the main working tree
+    # before anything runs. Previously this entry point only checked the
+    # directory existed, so a mis-supplied main-tree path (LLM hallucination,
+    # lost constraint after context compaction) reached bypass_permissions.
+    err = _assert_isolated_worktree(d)
+    if err:
+        return {"status": "error", "error": err, "directory": d}
     if not prompt:
         return {"status": "error", "error": "prompt is required"}
 
