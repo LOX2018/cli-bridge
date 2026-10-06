@@ -256,8 +256,8 @@ def _resolve_shim_target(shim_path: str) -> Optional[str]:
 
     npm installs ``opencode.CMD`` (a batch wrapper around ``opencode.exe``).
     Invoking the .CMD re-parses argv through cmd.exe, which **truncates multi-line
-    prompts** (verified: only the first line reached opencode). Invoking the real
-    .exe directly avoids cmd.exe entirely.
+    prompts** to their first line. Invoking the real .exe directly avoids
+    cmd.exe entirely.
     """
     import re
     try:

@@ -16,7 +16,8 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import cli_bridge_tool as cbt          # noqa: E402
+import cli_bridge_tool as cbt
+import cli_bridge_drivers as _drv   # _run moved here with qoder_run          # noqa: E402
 import opencode_driver as drv          # noqa: E402
 
 FAILURES = []
@@ -95,6 +96,66 @@ finally:
     git("worktree", "remove", "--force", wt, cwd=repo)
     shutil.rmtree(root, ignore_errors=True)
 
+print()
+print("=" * 66)
+print("[P2-8] permission_mode observability in qoder_run")
+print("=" * 66)
+# P0-1's finally removes the shared temp repo, so this section builds its
+# own: the annotation is reachable only through a live linked worktree.
+root, repo, wt = make_repo()
+try:
+    wt2, repo2 = wt, repo
+    _assert_isolated_worktree = cbt._assert_isolated_worktree
+    orig_run = _drv._run
+    # qoderclicn resolves on this host and `wt` is a linked worktree, so the
+    # P0-1 gate passes and control reaches the annotation.
+    #
+    # _run is faked to avoid spawning the real CLI -- but ONLY for non-git
+    # commands. _assert_isolated_worktree also goes through _run for its
+    # `git rev-parse --git-dir` probe; faking that too would return a stdout
+    # without "worktrees/" and turn a genuine linked worktree into a refused
+    # path, hiding the very branch under test.
+    def fake_run(cmd, cwd=None, timeout=60):
+        if cmd and os.path.basename(str(cmd[0])).lower().startswith("git"):
+            return orig_run(cmd, cwd=cwd, timeout=timeout)
+        # Mirror the real _run return shape: the key is "output", not "stdout"
+        # -- _assert_isolated_worktree reads res.get("output").
+        return {"status": "completed", "exit_code": 0, "output": "ok",
+                "stderr": "", "cmd": cmd}
+
+    _drv._run = fake_run
+
+    # Guard against a second fake: prove the gate itself still discriminates.
+    check("gate still accepts the linked worktree under the fake",
+          _assert_isolated_worktree(wt2) is None,
+          repr(_assert_isolated_worktree(wt2)))
+
+    # Default mode: bypass_permissions -> worktree_scoped True.
+    r = cbt.qoder_run(prompt="echo hi", directory=wt2)
+    check("default mode annotated as bypass",
+          r.get("permission_mode") == "bypass_permissions", str(r.get("permission_mode")))
+    check("worktree_scoped=True for bypass_permissions",
+          r.get("worktree_scoped") is True, str(r.get("worktree_scoped")))
+    check("bypass run still completed", r.get("status") == "completed", str(r.get("status")))
+
+    # Narrowed mode: a caller that opts out of bypass is marked accordingly.
+    r = cbt.qoder_run(prompt="echo hi", directory=wt2, permission_mode="dont_ask")
+    check("non-bypass mode recorded verbatim",
+          r.get("permission_mode") == "dont_ask", str(r.get("permission_mode")))
+    check("worktree_scoped=False for dont_ask",
+          r.get("worktree_scoped") is False, str(r.get("worktree_scoped")))
+
+    # Negative control: an error return (main tree refused) must NOT be
+    # annotated -- annotating a run that never happened would fabricate an audit
+    # trail.
+    r = cbt.qoder_run(prompt="echo hi", directory=repo)
+    check("refused run carries no permission_mode (not annotated)",
+          r.get("status") == "error" and "permission_mode" not in r,
+          str({k: r.get(k) for k in ("status", "permission_mode")}))
+finally:
+    _drv._run = orig_run
+    git("worktree", "remove", "--force", wt, cwd=repo)
+    shutil.rmtree(root, ignore_errors=True)
 print()
 print("=" * 66)
 print("[P0-3] opencode version gate -- CVE-2026-22812")

@@ -157,11 +157,21 @@ you just have to make the dispatch decisions yourself each time.
 ```
 plugin.yaml                          manifest
 __init__.py                          registers the tool with Hermes
-cli_bridge_tool.py                   implementation
+cli_bridge_tool.py                   facade: re-exports the public surface
+cli_bridge_schema.py                 CLI_BRIDGE_SCHEMA
+cli_bridge_common.py                 constants, bin resolution, _run
+cli_bridge_worktree.py               worktree lifecycle + isolation gate
+cli_bridge_drivers.py                opencode / codex / qoderclicn adapters
+cli_bridge_handlers.py               action -> adapter dispatch
+test_audit_fixes.py                  behavioural tests
 skills/multi-cli-orchestration/      bundled role-contract skill
 README.md
 LICENSE
 ```
+
+One module per responsibility. ``cli_bridge_tool`` is a thin facade so
+``__init__.py`` and existing importers keep working; the real code lives in
+the focused siblings.
 
 ## License
 
