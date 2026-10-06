@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """cli-bridge -- thin Hermes tools driving local coding CLIs.
 
-Implements the role contract in the ``multi-cli-orchestration`` skill:
+Implements the dispatch contract in the ``multi-cli-orchestration`` skill:
 
-  * ``qoder_run``   -> qoderclicn as the EXECUTOR (writes allowed, worktree-scoped)
-  * ``codex_review``-> codex as the READ-ONLY reviewer (code review of a diff)
+  * ``qoder_run``   -> qoderclicn executor call (writes allowed, worktree-scoped)
+  * ``codex_review``-> codex review call (read-only by nature)
   * ``worktree_*``  -> create / list / remove an ISOLATED git worktree for the
     executor, so the caller never hand-manages the write scope.
 
@@ -545,7 +545,7 @@ def codex_review(
     timeout: int = DEFAULT_TIMEOUT,
     base: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run codex's non-interactive code review (READ-ONLY) on a repo diff.
+    """Run codex's non-interactive code review on a repo diff.
 
     Defaults to reviewing uncommitted changes (``--uncommitted``); pass ``base``
     (a branch) to review against it instead.
@@ -571,6 +571,136 @@ def codex_review(
     else:
         cmd += ["--uncommitted"]
     return _run(cmd, cwd=d, timeout=_clamp_timeout(timeout))
+
+
+# ---------------------------------------------------------------------------
+# OpenCode driver (ported from the retired standalone opencode plugin)
+# ---------------------------------------------------------------------------
+#
+# The full OpenCode driver lives in ``opencode_driver.py`` (ported verbatim from
+# the retired upstream ``opencode`` plugin so its battle-tested behaviour is
+# preserved rather than re-implemented):
+#
+#   * npm ``.CMD`` shim -> real ``.exe`` resolution (cmd.exe truncates
+#     multi-line prompts -- verified on both opencode and codex)
+#   * stdin=DEVNULL everywhere (opencode blocks reading an inherited pipe)
+#   * JSON event-stream parsing (flat + SDK formats), file diffs, tool results
+#   * rate-limit fallback chain + built-in "build" agent fallback
+#
+# It is imported lazily: importing it starts no subprocess, and its
+# ``atexit`` hook only stops a server this driver itself started.
+
+
+def _opencode_driver():
+    """Import the OpenCode driver module, or return None if unavailable."""
+    try:
+        import opencode_driver as _drv
+    except Exception as exc:  # pragma: no cover - import-time safety net
+        logger.warning("opencode driver unavailable: %s", exc)
+        return None
+    return _drv
+
+
+def _opencode_bin() -> Optional[str]:
+    """Absolute path to the opencode binary, or None (for the status probe)."""
+    drv = _opencode_driver()
+    if drv is None:
+        return None
+    try:
+        return drv._resolve_opencode_bin()
+    except Exception:
+        return None
+
+
+def opencode_run(
+    prompt: str,
+    directory: Optional[str] = None,
+    agent: Optional[str] = None,
+    model: Optional[str] = None,
+    variant: Optional[str] = None,
+    session_id: Optional[str] = None,
+    files: Optional[List[str]] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> Dict[str, Any]:
+    """Run a one-shot OpenCode task.
+
+    Default agent is ``build`` (permission ``"*" allow``) so it CAN write — the
+    executor/reviewer split comes from the WORKTREE scope, not from the agent.
+    ``model=None`` falls back to the driver's ``DEFAULT_OPENCODE_MODEL``
+    (NOT opencode's own default, which is rate-limited on the shared free tier).
+    """
+    drv = _opencode_driver()
+    if drv is None:
+        return {"status": "unavailable", "error": "opencode driver not importable"}
+    if not drv.check_opencode_requirements():
+        return {"status": "unavailable", "error": "opencode CLI not found/executable"}
+    if not prompt:
+        return {"status": "error", "error": "prompt is required"}
+    return drv._run_task(
+        prompt=prompt,
+        directory=directory,
+        agent=agent,
+        model=model,
+        variant=variant,
+        session_id=session_id,
+        files=files,
+        timeout=_clamp_timeout(timeout),
+    )
+
+
+def opencode_session(
+    session_id: str,
+    prompt: str,
+    directory: Optional[str] = None,
+    agent: Optional[str] = None,
+    model: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> Dict[str, Any]:
+    """Send a multi-turn message to an existing OpenCode session.
+
+    ``model=None`` uses the driver's default (see ``opencode_run``).
+    """
+    drv = _opencode_driver()
+    if drv is None:
+        return {"status": "unavailable", "error": "opencode driver not importable"}
+    if not drv.check_opencode_requirements():
+        return {"status": "unavailable", "error": "opencode CLI not found/executable"}
+    if not prompt:
+        return {"status": "error", "error": "prompt is required"}
+    if not session_id:
+        return {"status": "error", "error": "session_id is required"}
+    return drv._session_prompt(
+        session_id=session_id,
+        prompt=prompt,
+        directory=directory,
+        agent=agent,
+        model=model,
+        timeout=_clamp_timeout(timeout),
+    )
+
+
+def opencode_agents(timeout: int = 30) -> Dict[str, Any]:
+    """Discovery: which agents the local opencode install actually knows."""
+    drv = _opencode_driver()
+    if drv is None:
+        return {"status": "unavailable", "error": "opencode driver not importable"}
+    agents = drv._list_agents(timeout=timeout)
+    return {
+        "status": "completed",
+        "opencode_available": drv.check_opencode_requirements(),
+        "agents": agents,
+        "oh_my_opencode_installed": drv._omo_installed(agents),
+        "fallback_agent": drv.FALLBACK_AGENT,
+    }
+
+
+def opencode_stop() -> Dict[str, Any]:
+    """Stop the OpenCode server started by this driver (if any)."""
+    drv = _opencode_driver()
+    if drv is None:
+        return {"status": "unavailable", "error": "opencode driver not importable"}
+    drv._stop_server()
+    return {"status": "stopped"}
 
 
 def codex_exec(
@@ -642,11 +772,36 @@ def cli_bridge_handler(args: Dict[str, Any], **kwargs) -> str:
                 force=_as_bool(args.get("force", False)),
                 timeout=args.get("timeout", 120),
             )
+        elif action == "opencode_run":
+            res = opencode_run(
+                prompt=str(args.get("prompt", "") or ""),
+                directory=(str(args["directory"]) if args.get("directory") else None),
+                agent=(str(args["agent"]) if args.get("agent") else None),
+                model=(str(args["model"]) if args.get("model") else None),
+                variant=(str(args["variant"]) if args.get("variant") else None),
+                session_id=(str(args["session_id"]) if args.get("session_id") else None),
+                files=(list(args["files"]) if args.get("files") else None),
+                timeout=args.get("timeout", DEFAULT_TIMEOUT),
+            )
+        elif action == "opencode_session":
+            res = opencode_session(
+                session_id=str(args.get("session_id", "") or ""),
+                prompt=str(args.get("prompt", "") or ""),
+                directory=(str(args["directory"]) if args.get("directory") else None),
+                agent=(str(args["agent"]) if args.get("agent") else None),
+                model=(str(args["model"]) if args.get("model") else None),
+                timeout=args.get("timeout", DEFAULT_TIMEOUT),
+            )
+        elif action == "opencode_agents":
+            res = opencode_agents(timeout=args.get("timeout", 30))
+        elif action == "opencode_stop":
+            res = opencode_stop()
         elif action == "status":
             res = {
                 "status": "completed",
                 "qoderclicn": _resolve_bin("qoderclicn") or _resolve_bin("qodercli"),
                 "codex": _resolve_bin("codex"),
+                "opencode": _opencode_bin(),
             }
         else:
             res = {"error": "unknown action %r; use: %s" % (
@@ -661,10 +816,15 @@ def cli_bridge_handler(args: Dict[str, Any], **kwargs) -> str:
 CLI_BRIDGE_SCHEMA = {
     "name": "cli_bridge",
     "description": (
-        "Drive local coding CLIs per the multi-cli-orchestration role contract. "
-        "Actions: 'qoder_run' (EXECUTOR -- qoderclicn writes inside an ISOLATED worktree; "
-        "directory is mandatory), 'codex_review' (READ-ONLY -- codex reviews a repo diff), "
-        "'codex_exec' (READ-ONLY -- codex exec in a read-only sandbox), "
+        "Drive local coding CLIs: opencode, qoderclicn and codex. Write capability is "
+        "granted by the worktree boundary, not the CLI name; Hermes is the only "
+        "committer. Actions: 'qoder_run' (writes inside an ISOLATED worktree; "
+        "directory is mandatory), 'codex_review' (codex reviews a repo diff), "
+        "'codex_exec' (codex exec in a read-only sandbox), "
+        "'opencode_run' (one-shot opencode task; build agent can write in its --dir), "
+        "'opencode_session' (send a message to an existing opencode session), "
+        "'opencode_agents' (list agents the local opencode knows), "
+        "'opencode_stop' (stop the opencode server this bridge started), "
         "'worktree_create/list/remove' (manage an isolated executor worktree safely), "
         "'status' (probe availability). Never point qoder_run at the main working tree."
     ),
@@ -674,7 +834,10 @@ CLI_BRIDGE_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": ["qoder_run", "codex_review", "codex_exec",
-                         "worktree_create", "worktree_list", "worktree_remove", "status"],
+                         "opencode_run", "opencode_session",
+                         "opencode_agents", "opencode_stop",
+                         "worktree_create", "worktree_list", "worktree_remove",
+                         "status"],
             },
             "prompt": {"type": "string", "description": "Task / review instructions."},
             "directory": {
@@ -687,8 +850,12 @@ CLI_BRIDGE_SCHEMA = {
             "path": {"type": "string", "description": "worktree_create/remove: worktree path (default <repo>-wt-<branch>)."},
             "force": {"type": "boolean", "description": "worktree_remove: force removal (--force). force=True is REFUSED when the worktree contains a junction/symlink; with force=False, links are unlinked (link only, never target) before removal."},
             "permission_mode": {"type": "string", "description": "qoder_run permission mode (default bypass_permissions -- dont_ask denies writes)."},
+            "agent": {"type": "string", "description": "opencode_*: agent name (e.g. 'build', 'plan', 'explore'). Leave empty for opencode's default."},
+            "variant": {"type": "string", "description": "opencode_run: model variant for reasoning effort (e.g. 'high', 'max')."},
+            "model": {"type": "string", "description": "Model override. qoder_run: see qoder docs. opencode_*: e.g. 'opencode/longcat-2.5-preview-free'. Omit for opencode to use its built-in default."},
+            "session_id": {"type": "string", "description": "opencode_session: REQUIRED. opencode_run: optionally continue a previous session."},
+            "files": {"type": "array", "items": {"type": "string"}, "description": "opencode_run: file paths to attach as context (must exist)."},
             "sandbox": {"type": "string", "description": "codex_exec sandbox (default read-only)."},
-            "model": {"type": "string", "description": "Optional model override (qoder_run)."},
             "timeout": {"type": "integer", "description": f"Seconds (default {DEFAULT_TIMEOUT} for CLI actions, 120 for worktree_create/remove, 60 for worktree_list; max {MAX_TIMEOUT})."},
         },
         "required": ["action"],
